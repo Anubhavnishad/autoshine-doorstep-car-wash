@@ -1,0 +1,1 @@
+{"name":"autoshine","private":true,"scripts":{"install:all":"npm i && npm i --prefix server && npm i --prefix client","seed":"npm run seed --prefix server","dev":"concurrently \"npm run dev --prefix server\" \"npm run dev --prefix client\"","build":"npm run build --prefix client","start":"npm start --prefix server"},"devDependencies":{"concurrently":"^9.0.0"}}

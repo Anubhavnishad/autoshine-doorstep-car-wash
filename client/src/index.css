@@ -1,0 +1,6 @@
+@tailwind base;@tailwind components;@tailwind utilities;
+body{@apply bg-slate-50 text-slate-800 overflow-x-hidden}
+.btn{@apply inline-flex items-center justify-center gap-2 rounded-xl bg-accent px-5 py-3 font-semibold text-white transition hover:brightness-110 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:opacity-50}
+.btn2{@apply btn bg-white !text-navy border border-slate-200}
+.card{@apply rounded-2xl bg-white p-5 shadow-sm border border-slate-100}
+.inp{@apply w-full rounded-xl border border-slate-300 px-4 py-3 focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/30}

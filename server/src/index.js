@@ -1,0 +1,54 @@
+import express from 'express';import cors from 'cors';import rateLimit from 'express-rate-limit';import bcrypt from 'bcryptjs';import jwt from 'jsonwebtoken';
+import path from 'path';import { fileURLToPath } from 'url';import fs from 'fs';
+import { config } from './config.js';import { run,get,all } from './db.js';
+const app=express();app.use(cors({origin:config.origin}));app.use(express.json({limit:'100kb'}));
+app.use('/api',rateLimit({windowMs:60000,limit:200}));
+const clean=v=>String(v??'').replace(/[<>]/g,'').trim().slice(0,200);
+const ok=(res,data,code=200)=>res.status(code).json({success:true,data});
+const fail=(res,code,error)=>res.status(code).json({success:false,error});
+const sign=u=>jwt.sign({id:u.id,role:u.role},config.jwt,{expiresIn:'7d'});
+const auth=(...roles)=>(req,res,next)=>{try{const t=jwt.verify((req.headers.authorization||'').slice(7),config.jwt);const u=get('SELECT id,name,email,phone,role FROM users WHERE id=? AND active=1',t.id);if(!u||(roles.length&&!roles.includes(u.role)))return fail(res,403,'Forbidden');req.user=u;next()}catch{fail(res,401,'Please log in')}};
+const optAuth=(req,_r,next)=>{try{req.user=jwt.verify((req.headers.authorization||'').slice(7),config.jwt)}catch{}next()};
+const ADJ={Hatchback:0,Sedan:50,SUV:100,Luxury:200};const ADDONS={'Interior Vacuum':149,'Tyre Dressing':99,'Dashboard Cleaning':99,'Premium Interior':299};
+const SLOTS=['8:00 AM','9:30 AM','11:00 AM','12:30 PM','2:00 PM','3:30 PM','5:00 PM','6:30 PM'];
+function quote({serviceId,vehicleType,addons=[],coupon}){const s=get('SELECT * FROM services WHERE id=? AND active=1',serviceId);if(!s||!(vehicleType in ADJ))throw new Error('Invalid service or vehicle');
+const sub=s.price+ADJ[vehicleType]+addons.reduce((a,x)=>a+(ADDONS[x]||0),0);let discount=0;
+if(coupon){const c=get('SELECT * FROM coupons WHERE code=? AND active=1',clean(coupon).toUpperCase());if(!c)throw new Error('Invalid coupon');discount=Math.min(sub,c.type==='flat'?c.value:Math.round(sub*c.value/100))}
+const tax=Math.round((sub-discount)*config.tax);return{subtotal:sub,discount,tax,total:sub-discount+tax,service:s}}
+const freeTechs=(date,slot)=>all(`SELECT id FROM users WHERE role='technician' AND active=1 AND status!='Offline' AND id NOT IN (SELECT technician_id FROM bookings WHERE date=? AND slot=? AND technician_id IS NOT NULL AND status NOT IN ('Cancelled','Completed'))`,date,slot);
+const notify=(uid,m)=>uid&&run('INSERT INTO notifications(user_id,message) VALUES(?,?)',uid,m);
+app.get('/api/config',(_q,r)=>ok(r,{...config.brand,demo:config.demo,addons:ADDONS,adjustments:ADJ,slots:SLOTS}));
+app.post('/api/auth/register',(q,r)=>{const{name,email,phone,password}=q.body;if(!clean(name)||!/^\S+@\S+\.\S+$/.test(email||'')||!/^\d{10}$/.test(phone||'')||(password||'').length<8)return fail(r,400,'Valid name, email, 10-digit phone and 8+ char password required');
+if(get('SELECT id FROM users WHERE email=?',email.toLowerCase()))return fail(r,409,'Email already registered');const i=run('INSERT INTO users(name,email,phone,password,role) VALUES(?,?,?,?,?)',clean(name),email.toLowerCase(),phone,bcrypt.hashSync(password,10),'customer');
+const u={id:i.lastInsertRowid,name:clean(name),email,role:'customer'};ok(r,{token:sign(u),user:u},201)});
+app.post('/api/auth/login',(q,r)=>{const u=get('SELECT * FROM users WHERE email=? AND active=1',clean(q.body.email).toLowerCase());if(!u||!bcrypt.compareSync(q.body.password||'',u.password))return fail(r,401,'Invalid email or password');ok(r,{token:sign(u),user:{id:u.id,name:u.name,email:u.email,role:u.role}})});
+app.get('/api/services',(_q,r)=>ok(r,all('SELECT * FROM services WHERE active=1')));
+app.get('/api/subscriptions',(_q,r)=>ok(r,all('SELECT * FROM subscription_plans').map(p=>({...p,features:p.features.split(',')}))));
+app.get('/api/slots',(q,r)=>ok(r,SLOTS.map(s=>({slot:s,available:freeTechs(clean(q.query.date),s).length>0}))));
+app.post('/api/quote',(q,r)=>{try{const{service,...x}=quote(q.body);ok(r,x)}catch(e){fail(r,400,e.message)}});
+app.post('/api/bookings',optAuth,(q,r)=>{try{const b=q.body;const{service,...p}=quote(b);
+if(!clean(b.name)||!/^\d{10}$/.test(b.phone||'')||!clean(b.address)||!/^\d{6}$/.test(b.pincode||'')||!b.date||!SLOTS.includes(b.slot)||!clean(b.regNo))return fail(r,400,'Please complete all required fields (valid 10-digit phone, 6-digit pincode)');
+const t=freeTechs(b.date,b.slot)[0];if(!t)return fail(r,409,'Slot no longer available');
+const id=`AS-${b.date.replaceAll('-','')}-${Math.floor(1000+Math.random()*9000)}`;
+run('INSERT INTO bookings(id,user_id,technician_id,service_id,vehicle_type,vehicle_model,reg_no,addons,address,city,pincode,date,slot,name,phone,email,subtotal,discount,tax,total,coupon,payment_method,payment_status,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id,q.user?.id||null,t.id,b.serviceId,b.vehicleType,clean(b.vehicleModel),clean(b.regNo).toUpperCase(),JSON.stringify(b.addons||[]),clean(b.address),clean(b.city),b.pincode,b.date,b.slot,clean(b.name),b.phone,clean(b.email),p.subtotal,p.discount,p.tax,p.total,clean(b.coupon).toUpperCase()||null,b.paymentMethod,b.paymentMethod==='Cash on Service'?'Pay on service':'DEMO - not a real payment','Assigned');
+notify(t.id,`New job ${id}`);notify(q.user?.id,`Booking ${id} confirmed`);ok(r,{id,...p,service:service.name},201)}catch(e){fail(r,400,e.message)}});
+app.get('/api/bookings/track',(q,r)=>{const b=get(`SELECT b.*,s.name service,u.name tech,u.rating tech_rating FROM bookings b JOIN services s ON s.id=b.service_id LEFT JOIN users u ON u.id=b.technician_id WHERE b.id=? AND b.phone=?`,clean(q.query.id),clean(q.query.mobile));b?ok(r,b):fail(r,404,'No booking found for that ID and mobile')});
+const withNames=`SELECT b.*,s.name service FROM bookings b JOIN services s ON s.id=b.service_id`;
+app.get('/api/customer/bookings',auth('customer'),(q,r)=>ok(r,all(withNames+' WHERE b.user_id=? ORDER BY b.created_at DESC',q.user.id)));
+app.patch('/api/bookings/:id',auth('customer','admin'),(q,r)=>{const b=get('SELECT * FROM bookings WHERE id=?',q.params.id);if(!b||(q.user.role==='customer'&&b.user_id!==q.user.id))return fail(r,404,'Not found');if(['Completed','Cancelled'].includes(b.status))return fail(r,409,'Booking already closed');run('UPDATE bookings SET status=? WHERE id=?','Cancelled',b.id);notify(b.technician_id,`Booking ${b.id} cancelled`);ok(r,{id:b.id,status:'Cancelled'})});
+app.post('/api/reviews',auth('customer'),(q,r)=>{const b=get('SELECT * FROM bookings WHERE id=? AND user_id=?',q.body.bookingId,q.user.id);if(!b||b.status!=='Completed')return fail(r,400,'Only completed bookings can be reviewed');const n=+q.body.rating;if(!(n>=1&&n<=5))return fail(r,400,'Rating 1-5');try{run('INSERT INTO reviews(booking_id,rating,text) VALUES(?,?,?)',b.id,n,clean(q.body.text))}catch{return fail(r,409,'Already reviewed')}ok(r,{},201)});
+const FLOW=['Assigned','Accepted','On The Way','Arrived','Cleaning','Completed'];const CHECK=['exterior','windows','tyres','interior','dashboard','addons'];
+app.get('/api/technician/jobs',auth('technician'),(q,r)=>ok(r,all(withNames+' WHERE b.technician_id=? ORDER BY b.date,b.slot',q.user.id)));
+app.patch('/api/technician/jobs/:id/status',auth('technician'),(q,r)=>{const b=get('SELECT * FROM bookings WHERE id=? AND technician_id=?',q.params.id,q.user.id);if(!b)return fail(r,404,'Not found');if(b.status==='Cancelled')return fail(r,409,'Cancelled booking');const next=FLOW[FLOW.indexOf(b.status)+1];if(!next)return fail(r,409,'Already completed');
+if(next==='Completed'){const c=q.body.checklist||{};if(!CHECK.every(k=>c[k]===true))return fail(r,400,'Complete the full checklist first');run('UPDATE bookings SET checklist=? WHERE id=?',JSON.stringify(c),b.id)}
+run('UPDATE bookings SET status=? WHERE id=?',next,b.id);notify(b.user_id,`Your booking ${b.id}: ${next}`);ok(r,{status:next})});
+app.get('/api/admin/dashboard',auth('admin'),(_q,r)=>ok(r,{today:get(`SELECT COUNT(*) n FROM bookings WHERE date=date('now')`).n,revenue:get(`SELECT COALESCE(SUM(total),0) n FROM bookings WHERE status!='Cancelled'`).n,pending:get(`SELECT COUNT(*) n FROM bookings WHERE status NOT IN ('Completed','Cancelled')`).n,completed:get(`SELECT COUNT(*) n FROM bookings WHERE status='Completed'`).n,cancelled:get(`SELECT COUNT(*) n FROM bookings WHERE status='Cancelled'`).n,customers:get(`SELECT COUNT(*) n FROM users WHERE role='customer'`).n,series:all(`SELECT date,COUNT(*) bookings,SUM(total) revenue FROM bookings GROUP BY date ORDER BY date DESC LIMIT 14`).reverse(),technicians:all(`SELECT id,name,status,rating FROM users WHERE role='technician' AND active=1`)}));
+app.get('/api/admin/bookings',auth('admin'),(q,r)=>{const s=`%${clean(q.query.search)}%`;ok(r,all(withNames+` WHERE (b.id LIKE ? OR b.name LIKE ? OR b.phone LIKE ?) AND (?='' OR b.status=?) ORDER BY b.created_at DESC`,s,s,s,clean(q.query.status),clean(q.query.status)))});
+app.post('/api/admin/assign-technician',auth('admin'),(q,r)=>{const b=get('SELECT * FROM bookings WHERE id=?',q.body.bookingId);const t=get(`SELECT id FROM users WHERE id=? AND role='technician' AND active=1 AND status='Available'`,q.body.technicianId);if(!b||!t)return fail(r,400,'Booking or available technician not found');
+if(get(`SELECT id FROM bookings WHERE technician_id=? AND date=? AND slot=? AND id!=? AND status NOT IN ('Cancelled','Completed')`,t.id,b.date,b.slot,b.id))return fail(r,409,'Technician already booked in that slot');run('UPDATE bookings SET technician_id=?,status=? WHERE id=?',t.id,'Assigned',b.id);notify(t.id,`New job ${b.id}`);ok(r,{})});
+app.patch('/api/admin/bookings/:id',auth('admin'),(q,r)=>{const b=get('SELECT status FROM bookings WHERE id=?',q.params.id);if(!b)return fail(r,404,'Not found');if(b.status==='Cancelled'&&q.body.status==='Completed')return fail(r,409,'Cancelled bookings cannot be completed');run('UPDATE bookings SET status=? WHERE id=?',clean(q.body.status),q.params.id);ok(r,{})});
+const dist=path.join(path.dirname(fileURLToPath(import.meta.url)),'../../client/dist');
+if(fs.existsSync(dist)){app.use(express.static(dist));app.get(/^\/(?!api).*/,(_q,r)=>r.sendFile(path.join(dist,'index.html')))}
+app.use('/api',(_q,r)=>fail(r,404,'Not found'));
+app.use((e,_q,r,_n)=>{console.error(e);fail(r,500,'Server error')});
+app.listen(config.port,()=>console.log(`API on :${config.port} (demo=${config.demo})`));
