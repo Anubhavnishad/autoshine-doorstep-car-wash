@@ -1,7 +1,7 @@
 import express from 'express';import cors from 'cors';import rateLimit from 'express-rate-limit';import bcrypt from 'bcryptjs';import jwt from 'jsonwebtoken';
 import path from 'path';import { fileURLToPath } from 'url';import fs from 'fs';
 import { config } from './config.js';import { run,get,all } from './db.js';
-const app=express();app.use(cors({origin:config.origin}));app.use(express.json({limit:'100kb'}));
+const app=express();app.set('trust proxy',1);app.use(cors({origin:config.origin}));app.use(express.json({limit:'100kb'}));
 app.use('/api',rateLimit({windowMs:60000,limit:200}));
 const clean=v=>String(v??'').replace(/[<>]/g,'').trim().slice(0,200);
 const ok=(res,data,code=200)=>res.status(code).json({success:true,data});
